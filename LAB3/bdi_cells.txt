@@ -1,0 +1,413 @@
+--- CELL 4 code ---
+
+class Tileworld:
+    def __init__(self, size=15, hole_probability=0.08,
+                 min_lifetime=8, max_lifetime=20, seed=42):
+        self.size = size
+        self.hole_probability = hole_probability
+        self.min_lifetime = min_lifetime
+        self.max_lifetime = max_lifetime
+        self.rng = random.Random(seed)
+
+        self.holes = {}  # (row, col) -> remaining lifetime
+        self.total_appeared = 0
+        self.total_filled = 0
+
+    def inside(self, position):
+        r, c = position
+        return 0 <= r < self.size and 0 <= c < self.size
+
+    def percept(self, agent_position):
+        return {
+            "agent": agent_position,
+            "holes": dict(self.holes)
+        }
+
+    def advance_one_tick(self):
+        # Age existing holes
+        expired = []
+        for position in self.holes:
+            self.holes[position] -= 1
+            if self.holes[position] <= 0:
+                expired.append(position)
+
+        for position in expired:
+            del self.holes[position]
+
+        # Randomly create a new hole
+        if self.rng.random() < self.hole_probability:
+            position = (
+                self.rng.randrange(self.size),
+                self.rng.randrange(self.size)
+            )
+
+            if position not in self.holes:
+                lifetime = self.rng.randint(
+                    self.min_lifetime, self.max_lifetime
+                )
+                self.holes[position] = lifetime
+                self.total_appeared += 1
+
+    def fill_hole(self, position):
+        if position in self.holes:
+            del self.holes[position]
+            self.total_filled += 1
+            return True
+        return False
+
+    def display(self, agent_position):
+        for r in range(self.size):
+            row = ""
+            for c in range(self.size):
+                position = (r, c)
+                if position == agent_position:
+                    row += "A "
+                elif position in self.holes:
+                    row += "H "
+                else:
+                    row += ". "
+            print(row)
+
+
+--- CELL 6 code ---
+
+class BDIAgent:
+    def __init__(self, start=(7, 7), gamma=1, commitment="single-minded"):
+        self.position = start
+        self.gamma = gamma
+        self.commitment = commitment
+
+        self.B = {}
+        self.I = None
+        self.plan_actions = []
+
+        self.actions_since_reconsideration = 0
+        self.trace = []
+
+    # brf(B, p): belief revision
+    def brf(self, percept):
+        self.B = {
+            "agent": percept["agent"],
+            "holes": dict(percept["holes"])
+        }
+        self.position = percept["agent"]
+
+    # options(B, I): generate currently available desires
+    def options(self):
+        desires = []
+        for hole in self.B["holes"]:
+            if hole != self.position:
+                desires.append(hole)
+
+        # Sort by Manhattan distance.
+        desires.sort(key=lambda x: self.manhattan(self.position, x))
+        return desires
+
+    # filter(B, D, I): choose the preferred desire
+    def filter(self, desires):
+        if len(desires) == 0:
+            return None
+
+        # Nearest hole is the preferred option.
+        return desires[0]
+
+    def manhattan(self, a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    # plan(B, I): shortest Manhattan path
+    def plan(self, intention):
+        if intention is None:
+            return []
+
+        current = self.position
+        actions = []
+
+        # Move vertically first
+        while current[0] < intention[0]:
+            actions.append("DOWN")
+            current = (current[0] + 1, current[1])
+
+        while current[0] > intention[0]:
+            actions.append("UP")
+            current = (current[0] - 1, current[1])
+
+        # Move horizontally second
+        while current[1] < intention[1]:
+            actions.append("RIGHT")
+            current = (current[0], current[1] + 1)
+
+        while current[1] > intention[1]:
+            actions.append("LEFT")
+            current = (current[0], current[1] - 1)
+
+        return actions
+
+    def intention_achieved(self):
+        return self.I is not None and self.position == self.I
+
+    def intention_achievable(self):
+        if self.I is None:
+            return False
+
+        return self.I in self.B["holes"]
+
+    def execute_action(self):
+        if len(self.plan_actions) == 0:
+            return False
+
+        action = self.plan_actions.pop(0)
+
+        r, c = self.position
+
+        if action == "UP":
+            r -= 1
+        elif action == "DOWN":
+            r += 1
+        elif action == "LEFT":
+            c -= 1
+        elif action == "RIGHT":
+            c += 1
+
+        self.position = (r, c)
+        self.B["agent"] = self.position
+
+        return True
+
+
+--- CELL 8 code ---
+
+def run_bdi(gamma=1, world_speed=1, seed=42,
+            num_steps=600, commitment="single-minded",
+            verbose_trace=True):
+
+    world = Tileworld(
+        size=GRID_SIZE,
+        hole_probability=HOLE_PROBABILITY,
+        min_lifetime=MIN_LIFETIME,
+        max_lifetime=MAX_LIFETIME,
+        seed=seed
+    )
+
+    agent = BDIAgent(
+        start=(GRID_SIZE // 2, GRID_SIZE // 2),
+        gamma=gamma,
+        commitment=commitment
+    )
+
+    # Initial world tick/percept
+    for _ in range(world_speed):
+        world.advance_one_tick()
+
+    agent.brf(world.percept(agent.position))
+
+    for step in range(num_steps):
+
+        # Step 3 of Algorithm 1:
+        # Deliberate when there is no intention or no plan.
+        if agent.I is None or len(agent.plan_actions) == 0:
+
+            desires = agent.options()
+
+            if len(desires) == 0:
+                agent.trace.append(
+                    (step, "NO_OPTION", None)
+                )
+
+            else:
+                new_intention = agent.filter(desires)
+
+                if new_intention is not None:
+                    agent.I = new_intention
+                    agent.plan_actions = agent.plan(agent.I)
+
+                    agent.trace.append(
+                        (step, "COMMIT", agent.I)
+                    )
+
+        # Execute first action
+        if len(agent.plan_actions) > 0:
+            agent.execute_action()
+
+            # Fill hole when agent reaches its intention
+            if agent.I == agent.position:
+                if world.fill_hole(agent.position):
+                    agent.trace.append(
+                        (step, "ACHIEVE", agent.I)
+                    )
+
+                agent.I = None
+                agent.plan_actions = []
+                agent.actions_since_reconsideration = 0
+
+        # World advances while action is performed
+        for _ in range(world_speed):
+            world.advance_one_tick()
+
+        # Revise beliefs
+        agent.brf(world.percept(agent.position))
+
+        if agent.I is not None:
+
+            # If intention has disappeared, single-minded commitment drops it.
+            if not agent.intention_achievable():
+                agent.trace.append(
+                    (step, "DROP_UNACHIEVABLE", agent.I)
+                )
+
+                agent.I = None
+                agent.plan_actions = []
+                agent.actions_since_reconsideration = 0
+
+            else:
+                agent.actions_since_reconsideration += 1
+
+                # Algorithm 2
+                if agent.actions_since_reconsideration >= gamma:
+
+                    agent.actions_since_reconsideration = 0
+
+                    # Deliberation has a cost:
+                    # world advances one extra time step.
+                    world.advance_one_tick()
+                    agent.brf(world.percept(agent.position))
+
+                    if not agent.intention_achievable():
+                        agent.trace.append(
+                            (step, "DROP_UNACHIEVABLE", agent.I)
+                        )
+
+                        agent.I = None
+                        agent.plan_actions = []
+
+                    else:
+                        desires = agent.options()
+                        preferred = agent.filter(desires)
+
+                        if preferred != agent.I and preferred is not None:
+                            old = agent.I
+                            agent.I = preferred
+                            agent.plan_actions = agent.plan(agent.I)
+
+                            agent.trace.append(
+                                (step, "SWITCH", (old, preferred))
+                            )
+
+    effectiveness = 0.0
+    if world.total_appeared > 0:
+        effectiveness = world.total_filled / world.total_appeared
+
+    if verbose_trace:
+        print("Gamma:", gamma)
+        print("World speed:", world_speed)
+        print("Holes appeared:", world.total_appeared)
+        print("Holes filled:", world.total_filled)
+        print("Effectiveness:", round(effectiveness, 4))
+
+        print("\nImportant event trace:")
+        for event in agent.trace[:40]:
+            print(event)
+
+    return {
+        "gamma": gamma,
+        "world_speed": world_speed,
+        "appeared": world.total_appeared,
+        "filled": world.total_filled,
+        "effectiveness": effectiveness,
+        "trace": agent.trace
+    }
+
+
+--- CELL 10 code ---
+result = run_bdi(gamma=4, world_speed=2, seed=42, num_steps=100)
+
+--- CELL 12 markdown ---
+
+## 6. Exercise 1 — Boldness against dynamism
+
+Sweep:
+
+- `γ ∈ {1, 2, 4, 8, bold}`
+- world speed ∈ `{1, 2, 4, 8}`
+- at least 25 random seeds
+- 600 agent steps per run
+
+For `bold`, use a value larger than the longest possible plan in the 15 × 15 grid. The maximum Manhattan distance is 28, so a value such as 100 represents bold behaviour.
+
+
+--- CELL 14 code ---
+
+# Find best gamma at each world speed
+
+best_by_speed = {}
+
+for speed in world_speeds:
+    values = results[speed]
+
+    best_index = 0
+    for i in range(1, len(values)):
+        if values[i] > values[best_index]:
+            best_index = i
+
+    best_by_speed[speed] = gamma_labels[best_index]
+
+print("Best gamma at each world speed:")
+for speed in world_speeds:
+    print("World speed =", speed, "-> gamma =", best_by_speed[speed])
+
+
+--- CELL 16 markdown ---
+
+## 7. Exercise 1 — Interpretation
+
+The experiment is testing a trade-off:
+
+**Frequent reconsideration**
+→ better awareness of changing holes  
+→ but deliberation consumes time  
+→ the world changes while the agent is thinking.
+
+**Infrequent reconsideration**
+→ less deliberation overhead  
+→ more time executing plans  
+→ but the agent can continue following a plan whose target has become poor or impossible.
+
+Therefore, the best `γ` is expected to depend on world speed. As the world becomes more dynamic, shorter reconsideration intervals become more valuable.
+
+The exact numerical optimum must be obtained from your run because it depends on the random seeds and implementation.
+
+
+--- CELL 18 code ---
+
+class ResourceBDIAgent(BDIAgent):
+    def __init__(self, start=(7, 7), charger=(7, 7), battery=40):
+        super().__init__(start=start, gamma=1)
+        self.charger = charger
+        self.battery_capacity = battery
+        self.battery = battery
+        self.stranded_steps = 0
+
+    def can_reach_and_return(self, hole):
+        trip = self.manhattan(self.position, hole)
+        return_to_charger = self.manhattan(hole, self.charger)
+
+        return self.battery >= trip + return_to_charger
+
+    def resource_filter(self):
+        valid_holes = []
+
+        for hole in self.B["holes"]:
+            if self.can_reach_and_return(hole):
+                valid_holes.append(hole)
+
+        if len(valid_holes) == 0:
+            return "RECHARGE"
+
+        valid_holes.sort(
+            key=lambda x: self.manhattan(self.position, x)
+        )
+
+        return valid_holes[0]
+
+    def recharge(self):
+        if self.position == self.charger:
+            self.battery = self.battery_capacity
